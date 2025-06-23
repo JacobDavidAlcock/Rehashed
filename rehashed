@@ -1,0 +1,186 @@
+#!/bin/bash
+
+# A script to automate paginated searches on the DeHashed API,
+# extracting emails and email/password combinations.
+#
+# This version reads the full multi-line curl command from standard input,
+# and uses `eval` to safely parse it, handling all complex quoting.
+# You can control the delay between requests with the -t flag.
+
+# --- Configuration ---
+# Output file for all unique emails found
+ALL_EMAILS_FILE="all_emails.txt"
+# Output file for email:password combinations
+CREDS_FILE="email_password_combinations.txt"
+# Default seconds to wait between requests to avoid rate limiting
+DEFAULT_DELAY=2
+
+# --- Show Usage/Help ---
+show_help() {
+    echo "Usage: ./rehashed [-t <seconds>]"
+    echo ""
+    echo "This script will prompt you to paste a multi-line curl command."
+    echo ""
+    echo "Options:"
+    echo "  -t <seconds>   Set the delay (in seconds) between each API request. Defaults to $DEFAULT_DELAY."
+    echo "  -h             Show this help message."
+}
+
+# --- Main Function ---
+main() {
+    local delay="$DEFAULT_DELAY"
+
+    # --- Parse Command-Line Options ---
+    while getopts "ht:" opt; do
+        case $opt in
+            h)
+                show_help
+                exit 0
+                ;;
+            t)
+                delay="$OPTARG"
+                ;;
+            \?)
+                show_help
+                exit 1
+                ;;
+        esac
+    done
+    
+    # Check for required command-line tools
+    if ! command -v jq &> /dev/null; then
+        echo "Error: 'jq' is not installed. Please install it to parse JSON."
+        echo "On Debian/Ubuntu: sudo apt-get install jq"
+        echo "On macOS: brew install jq"
+        exit 1
+    fi
+
+    # Prompt user to paste the command
+    echo "Please paste the full, multi-line curl command from your browser."
+    echo "After pasting, press ENTER, then press CTRL+D to continue."
+    
+    # Read the entire multi-line command as a single string
+    local pasted_command
+    pasted_command=$(cat)
+
+    if [ -z "$pasted_command" ]; then
+        echo "Error: No input received. Aborting."
+        exit 1
+    fi
+    
+    # --- Authentication ---
+    # Securely prompt for the Authorization Bearer Token if a placeholder is found
+    if [[ "$pasted_command" == *"[redacted]"* ]]; then
+        read -sp "Enter your DeHashed API Bearer Token: " bearer_token
+        echo # Newline after password input
+
+        if [ -z "$bearer_token" ]; then
+            echo "Error: Bearer token cannot be empty."
+            exit 1
+        fi
+        # Replace the placeholder with the actual token. This is done before eval for security.
+        pasted_command=$(echo "$pasted_command" | sed "s/\[redacted\]/$bearer_token/g")
+    fi
+
+    # --- Parse the command using eval into an array ---
+    # This is the most reliable way to handle the complex quoting and unquoted
+    # arguments that come from browser "Copy as cURL" commands.
+    local cmd_array
+    eval "cmd_array=($pasted_command)"
+
+    # --- Separate the command from the data payload ---
+    local original_data_raw=""
+    local curl_base_array=()
+    local skip_next=false
+    for i in "${!cmd_array[@]}"; do
+        if $skip_next; then
+            skip_next=false
+            continue
+        fi
+
+        if [[ "${cmd_array[i]}" == "--data-raw" ]]; then
+            original_data_raw="${cmd_array[i+1]}"
+            skip_next=true # The next item is the payload, so we skip it
+        else
+            curl_base_array+=("${cmd_array[i]}")
+        fi
+    done
+
+    if [ -z "$original_data_raw" ]; then
+        echo "Error: Could not parse --data-raw from the pasted curl command."
+        exit 1
+    fi
+    
+    # --- API Pagination Loop ---
+    echo "Starting API requests with a ${delay}-second delay between pages..."
+    # Clear previous results
+    > "$ALL_EMAILS_FILE"
+    > "$CREDS_FILE"
+    
+    local page=1
+    while true; do
+        # Update the page number in the JSON data payload
+        local updated_data_raw
+        updated_data_raw=$(echo "$original_data_raw" | jq --argjson p "$page" '.page = $p')
+
+        echo "Fetching page: $page"
+        
+        # Execute the command using array expansion. This is safe from word
+        # splitting and quoting issues, as each element is passed as a distinct argument.
+        local response
+        if ! response=$("${curl_base_array[@]}" --data-raw "$updated_data_raw"); then
+            echo "Error: The curl command failed."
+            exit 1
+        fi
+
+        # Check for rate limit response before trying to parse JSON
+        if [[ "$response" == "Too Many Requests" ]]; then
+            echo "Rate limited by API. Please try again later with a longer delay using the -t flag."
+            break
+        fi
+
+        # Check if the response is valid JSON
+        if ! echo "$response" | jq empty; then
+            echo "Error: Received an invalid JSON response from the server."
+            echo "Response: $response"
+            break
+        fi
+
+        # Extract emails and append to the file
+        echo "$response" | jq -r '.results[]?.email[]?' | grep --color=never -v "null" >> "$ALL_EMAILS_FILE"
+
+        # Extract email and password combinations and append to the file
+        echo "$response" | jq -r '.results[] | select(.email and .password) | "\(.email[0]):\(.password)"' | grep --color=never -v "null" >> "$CREDS_FILE"
+
+        # Check if there is a next page and if there are results
+        local next_page
+        next_page=$(echo "$response" | jq -r '.next_page')
+        local has_results
+        has_results=$(jq -r '.results | length > 0' <<< "$response")
+
+        if [ "$next_page" != "true" ] || [ "$has_results" != "true" ]; then
+            echo "No more pages or results found. The process is complete."
+            break
+        fi
+
+        # Increment page for the next iteration
+        ((page++))
+
+        # Add the configurable delay to be respectful to the API
+        sleep "$delay"
+    done
+
+    # Remove duplicate entries and clean up the files
+    echo "Deduplicating results..."
+    sort -u -o "$ALL_EMAILS_FILE" "$ALL_EMAILS_FILE"
+    sort -u -o "$CREDS_FILE" "$CREDS_FILE"
+
+    echo "----------------------------------------"
+    echo "Scan complete!"
+    echo "All unique emails have been saved to: $ALL_EMAILS_FILE"
+    echo "Email/Password combinations have been saved to: $CREDS_FILE"
+    echo "----------------------------------------"
+}
+
+# Run the main function with command-line options
+main "$@"
