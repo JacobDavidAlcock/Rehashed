@@ -35,9 +35,11 @@ brew install jq
 
 ## Installation & Usage
 
-### 1. Save the Script
+### 1. Get the Script
 
-Save the script from the Canvas to a file named `rehashed`.
+```bash
+git clone https://github.com/JacobDavidAlcock/Rehashed && cd ./Rehashed
+```
 
 ### 2. Make the Script Executable
 
